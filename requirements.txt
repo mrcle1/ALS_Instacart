@@ -1,0 +1,25 @@
+# Core scientific stack
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+scikit-learn>=1.3
+
+# Models
+implicit>=0.7.2           # ALS collaborative filtering
+mlxtend>=0.23.0           # FP-Growth association rule mining
+
+# Visualisation
+matplotlib>=3.7
+seaborn>=0.13
+
+# Pipeline / API
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2.5
+
+# Parallel & progress
+joblib>=1.3
+tqdm>=4.66
+
+# Optional: parquet I/O
+pyarrow>=12.0
