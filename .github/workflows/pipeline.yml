@@ -1,0 +1,200 @@
+# =============================================================================
+# Instacart Recommender — pipeline.yml
+# =============================================================================
+# End-to-end data + training + inference pipeline definition.
+#
+# The structure is intentionally platform-agnostic: a simple orchestrator
+# (or a future Airflow / Prefect / Dagster deployment) can step through
+# the `stages` list.  Each stage declares:
+#   * id              — unique stage identifier
+#   * module          — Python module to import (relative to the project root)
+#   * entrypoint      — function name to call
+#   * params          — kwargs forwarded to the entrypoint
+#   * depends_on      — list of stage ids that must complete first
+#   * on_failure      — one of "halt" (default), "skip", "retry"
+#   * retries         — number of attempts before giving up
+# =============================================================================
+
+pipeline:
+  name: instacart-recommender
+  version: "1.0.0"
+  description: |
+    Recommendation pipeline for the Instacart Superstore dataset
+    (https://www.kaggle.com/datasets/mohdshahnawazaadil/supermarket-superstore-dataset-bundle).
+    Trains an ALS collaborative-filtering model and an FPGrowth
+    association-rule miner, evaluates both, and exposes them through
+    the FastAPI surface.
+
+# ---------------------------------------------------------------------------
+# Default settings applied to every stage unless overridden.
+# ---------------------------------------------------------------------------
+defaults:
+  config_ini: config.ini
+  artifacts_dir: artifacts
+  log_level: INFO
+
+# ---------------------------------------------------------------------------
+# Stage-by-stage definition.  Order is given by depends_on; stages
+# without dependencies can run in parallel.
+# ---------------------------------------------------------------------------
+stages:
+
+  # 1 ─── DATA INGESTION ────────────────────────────────────────────────────
+  - id: ingest_raw
+    module: src.data.loader
+    entrypoint: load_instacart_raw
+    params:
+      path: ${paths.raw_data}
+      validate: true
+    depends_on: []
+    on_failure: halt
+    retries: 2
+    outputs:
+      - artifacts/raw_ingest_meta.json
+
+  # 2 ─── TRAIN / TEST SPLIT ────────────────────────────────────────────────
+  - id: split
+    module: src.data.splitter
+    entrypoint: build_train_test_split_parallel
+    params:
+      test_ratio: ${data.test_ratio}
+      random_state: ${data.random_state}
+      min_user_items: ${data.min_user_items}
+      n_jobs: ${eval.n_jobs}
+    depends_on: [ingest_raw]
+    on_failure: halt
+    retries: 1
+    outputs:
+      - artifacts/predictions/train_split.csv
+      - artifacts/predictions/test_split.csv
+
+  # 3 ─── LABEL ENCODING & SPARSE MATRIX ───────────────────────────────────
+  - id: encode
+    module: src.data.encoders
+    entrypoint: encode_train_split
+    depends_on: [split]
+    on_failure: halt
+    outputs:
+      - artifacts/models/encoders.pkl
+
+  - id: build_matrices
+    module: src.data.encoders
+    entrypoint: build_user_item_matrix
+    params:
+      alpha: ${als.alpha}
+    depends_on: [encode]
+    on_failure: halt
+
+  - id: build_ground_truth
+    module: src.data.encoders
+    entrypoint: build_ground_truth
+    depends_on: [encode]
+    on_failure: halt
+
+  # 4 ─── ALS MODEL TRAINING ────────────────────────────────────────────────
+  - id: train_als
+    module: src.models.als_model
+    entrypoint: ALSRecommender.fit
+    params:
+      factors: ${als.factors}
+      regularization: ${als.regularization}
+      iterations: ${als.iterations}
+      use_gpu: ${als.use_gpu}
+      num_threads: ${als.num_threads}
+    depends_on: [build_matrices]
+    on_failure: halt
+    retries: 1
+    outputs:
+      - artifacts/models/als_model.pkl
+
+  # 5 ─── FPGrowth MODEL TRAINING ───────────────────────────────────────────
+  - id: train_fpgrowth
+    module: src.models.fpgrowth_model
+    entrypoint: FPGrowthRecommender.fit
+    params:
+      min_support: ${fpgrowth.min_support}
+      min_confidence: ${fpgrowth.min_confidence}
+      min_lift: ${fpgrowth.min_lift}
+      max_len: ${fpgrowth.max_len}
+    depends_on: [split]
+    on_failure: skip        # FPGrowth is optional; ALS is the workhorse
+    retries: 1
+    outputs:
+      - artifacts/models/fpgrowth_model.pkl
+
+  # 6 ─── EVALUATION ────────────────────────────────────────────────────────
+  - id: evaluate_als
+    module: src.evaluation.evaluator
+    entrypoint: evaluate_recommender
+    params:
+      k_values: ${eval.k_values}
+      sample_size: ${eval.sample_size}
+      n_jobs: ${eval.n_jobs}
+    depends_on: [train_als, build_ground_truth]
+    on_failure: halt
+    outputs:
+      - artifacts/predictions/als_eval_summary.csv
+
+  # 7 ─── TRAINING DASHBOARD ────────────────────────────────────────────────
+  - id: render_training_viz
+    module: src.visualization.training_viz
+    entrypoint: render_training_dashboard
+    depends_on: [evaluate_als]
+    on_failure: skip
+    outputs:
+      - artifacts/plots/training_dashboard.png
+
+  # 8 ─── INFERENCE (ALS) ───────────────────────────────────────────────────
+  - id: infer_als
+    module: src.pipeline.infer_pipeline
+    entrypoint: run_inference_pipeline
+    params:
+      algorithm: als
+      N: 10
+    depends_on: [train_als, train_fpgrowth]
+    on_failure: skip
+    outputs:
+      - artifacts/predictions/predictions_als.csv
+      - artifacts/predictions/inference_eval_als.csv
+      - artifacts/plots/inference_dashboard_als.png
+
+  # 9 ─── INFERENCE (FPGrowth) ──────────────────────────────────────────────
+  - id: infer_fpgrowth
+    module: src.pipeline.infer_pipeline
+    entrypoint: run_inference_pipeline
+    params:
+      algorithm: fpgrowth
+      N: 10
+    depends_on: [train_fpgrowth]
+    on_failure: skip
+    outputs:
+      - artifacts/predictions/predictions_fpgrowth.csv
+      - artifacts/predictions/inference_eval_fpgrowth.csv
+      - artifacts/plots/inference_dashboard_fpgrowth.png
+
+# ---------------------------------------------------------------------------
+# Convenience commands the operator can invoke without writing Python.
+# These map 1:1 onto the pipeline stages above; the CLI simply
+# `python -m` invokes the relevant module/function pair.
+# ---------------------------------------------------------------------------
+commands:
+  train:
+    description: Run the entire training pipeline.
+    module: src.pipeline.train_pipeline
+    entrypoint: run_training_pipeline
+
+  infer-als:
+    description: Run ALS inference for the default test cohort.
+    module: src.pipeline.infer_pipeline
+    entrypoint: run_inference_pipeline
+    params: { algorithm: als, N: 10 }
+
+  infer-fpgrowth:
+    description: Run FPGrowth inference for the default test cohort.
+    module: src.pipeline.infer_pipeline
+    entrypoint: run_inference_pipeline
+    params: { algorithm: fpgrowth, N: 10 }
+
+  serve:
+    description: Launch the FastAPI service.
+    shell: "uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload"
