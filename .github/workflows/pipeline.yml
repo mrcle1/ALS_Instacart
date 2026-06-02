@@ -15,186 +15,141 @@
 #   * retries         — number of attempts before giving up
 # =============================================================================
 
-pipeline:
-  name: instacart-recommender
-  version: "1.0.0"
-  description: |
-    Recommendation pipeline for the Instacart Superstore dataset
-    (https://www.kaggle.com/datasets/mohdshahnawazaadil/supermarket-superstore-dataset-bundle).
-    Trains an ALS collaborative-filtering model and an FPGrowth
-    association-rule miner, evaluates both, and exposes them through
-    the FastAPI surface.
+name: Instacart Recommender Pipeline
 
-# ---------------------------------------------------------------------------
-# Default settings applied to every stage unless overridden.
-# ---------------------------------------------------------------------------
-defaults:
-  config_ini: config.ini
-  artifacts_dir: artifacts
-  log_level: INFO
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main, dev ]
 
-# ---------------------------------------------------------------------------
-# Stage-by-stage definition.  Order is given by depends_on; stages
-# without dependencies can run in parallel.
-# ---------------------------------------------------------------------------
-stages:
+jobs:
+  smoke-tests-training:
+    name: Smoke Tests - Training
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
 
-  # 1 ─── DATA INGESTION ────────────────────────────────────────────────────
-  - id: ingest_raw
-    module: src.data.loader
-    entrypoint: load_instacart_raw
-    params:
-      path: ${paths.raw_data}
-      validate: true
-    depends_on: []
-    on_failure: halt
-    retries: 2
-    outputs:
-      - artifacts/raw_ingest_meta.json
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-  # 2 ─── TRAIN / TEST SPLIT ────────────────────────────────────────────────
-  - id: split
-    module: src.data.splitter
-    entrypoint: build_train_test_split_parallel
-    params:
-      test_ratio: ${data.test_ratio}
-      random_state: ${data.random_state}
-      min_user_items: ${data.min_user_items}
-      n_jobs: ${eval.n_jobs}
-    depends_on: [ingest_raw]
-    on_failure: halt
-    retries: 1
-    outputs:
-      - artifacts/predictions/train_split.csv
-      - artifacts/predictions/test_split.csv
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          cache: 'pip'
 
-  # 3 ─── LABEL ENCODING & SPARSE MATRIX ───────────────────────────────────
-  - id: encode
-    module: src.data.encoders
-    entrypoint: encode_train_split
-    depends_on: [split]
-    on_failure: halt
-    outputs:
-      - artifacts/models/encoders.pkl
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt 2>/dev/null || pip install pytest pyyaml
 
-  - id: build_matrices
-    module: src.data.encoders
-    entrypoint: build_user_item_matrix
-    params:
-      alpha: ${als.alpha}
-    depends_on: [encode]
-    on_failure: halt
+      - name: Smoke test - ALS model training module
+        run: |
+          python -m pytest tests/smoke/test_als_training.py -v --tb=short
 
-  - id: build_ground_truth
-    module: src.data.encoders
-    entrypoint: build_ground_truth
-    depends_on: [encode]
-    on_failure: halt
+      - name: Smoke test - FPGrowth model training module
+        run: |
+          python -m pytest tests/smoke/test_fpgrowth_training.py -v --tb=short
 
-  # 4 ─── ALS MODEL TRAINING ────────────────────────────────────────────────
-  - id: train_als
-    module: src.models.als_model
-    entrypoint: ALSRecommender.fit
-    params:
-      factors: ${als.factors}
-      regularization: ${als.regularization}
-      iterations: ${als.iterations}
-      use_gpu: ${als.use_gpu}
-      num_threads: ${als.num_threads}
-    depends_on: [build_matrices]
-    on_failure: halt
-    retries: 1
-    outputs:
-      - artifacts/models/als_model.pkl
+  smoke-tests-inference:
+    name: Smoke Tests - Inference Algorithms
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: smoke-tests-training
 
-  # 5 ─── FPGrowth MODEL TRAINING ───────────────────────────────────────────
-  - id: train_fpgrowth
-    module: src.models.fpgrowth_model
-    entrypoint: FPGrowthRecommender.fit
-    params:
-      min_support: ${fpgrowth.min_support}
-      min_confidence: ${fpgrowth.min_confidence}
-      min_lift: ${fpgrowth.min_lift}
-      max_len: ${fpgrowth.max_len}
-    depends_on: [split]
-    on_failure: skip        # FPGrowth is optional; ALS is the workhorse
-    retries: 1
-    outputs:
-      - artifacts/models/fpgrowth_model.pkl
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-  # 6 ─── EVALUATION ────────────────────────────────────────────────────────
-  - id: evaluate_als
-    module: src.evaluation.evaluator
-    entrypoint: evaluate_recommender
-    params:
-      k_values: ${eval.k_values}
-      sample_size: ${eval.sample_size}
-      n_jobs: ${eval.n_jobs}
-    depends_on: [train_als, build_ground_truth]
-    on_failure: halt
-    outputs:
-      - artifacts/predictions/als_eval_summary.csv
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          cache: 'pip'
 
-  # 7 ─── TRAINING DASHBOARD ────────────────────────────────────────────────
-  - id: render_training_viz
-    module: src.visualization.training_viz
-    entrypoint: render_training_dashboard
-    depends_on: [evaluate_als]
-    on_failure: skip
-    outputs:
-      - artifacts/plots/training_dashboard.png
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt 2>/dev/null || pip install pytest pyyaml
 
-  # 8 ─── INFERENCE (ALS) ───────────────────────────────────────────────────
-  - id: infer_als
-    module: src.pipeline.infer_pipeline
-    entrypoint: run_inference_pipeline
-    params:
-      algorithm: als
-      N: 10
-    depends_on: [train_als, train_fpgrowth]
-    on_failure: skip
-    outputs:
-      - artifacts/predictions/predictions_als.csv
-      - artifacts/predictions/inference_eval_als.csv
-      - artifacts/plots/inference_dashboard_als.png
+      - name: Smoke test - ALS inference algorithm
+        run: |
+          python -m pytest tests/smoke/test_als_inference.py -v --tb=short
 
-  # 9 ─── INFERENCE (FPGrowth) ──────────────────────────────────────────────
-  - id: infer_fpgrowth
-    module: src.pipeline.infer_pipeline
-    entrypoint: run_inference_pipeline
-    params:
-      algorithm: fpgrowth
-      N: 10
-    depends_on: [train_fpgrowth]
-    on_failure: skip
-    outputs:
-      - artifacts/predictions/predictions_fpgrowth.csv
-      - artifacts/predictions/inference_eval_fpgrowth.csv
-      - artifacts/plots/inference_dashboard_fpgrowth.png
+      - name: Smoke test - FPGrowth inference algorithm
+        run: |
+          python -m pytest tests/smoke/test_fpgrowth_inference.py -v --tb=short
 
-# ---------------------------------------------------------------------------
-# Convenience commands the operator can invoke without writing Python.
-# These map 1:1 onto the pipeline stages above; the CLI simply
-# `python -m` invokes the relevant module/function pair.
-# ---------------------------------------------------------------------------
-commands:
-  train:
-    description: Run the entire training pipeline.
-    module: src.pipeline.train_pipeline
-    entrypoint: run_training_pipeline
+  api-tests:
+    name: Smoke Tests - API Requests & Endpoints
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: smoke-tests-inference
 
-  infer-als:
-    description: Run ALS inference for the default test cohort.
-    module: src.pipeline.infer_pipeline
-    entrypoint: run_inference_pipeline
-    params: { algorithm: als, N: 10 }
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-  infer-fpgrowth:
-    description: Run FPGrowth inference for the default test cohort.
-    module: src.pipeline.infer_pipeline
-    entrypoint: run_inference_pipeline
-    params: { algorithm: fpgrowth, N: 10 }
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          cache: 'pip'
 
-  serve:
-    description: Launch the FastAPI service.
-    shell: "uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt 2>/dev/null || pip install pytest pyyaml requests fastapi uvicorn
+
+      - name: Start FastAPI server
+        run: |
+          nohup uvicorn api.main:app --host 127.0.0.1 --port 8000 > api.log 2>&1 &
+          echo "Waiting for API server to start..."
+          sleep 5
+          curl -f http://127.0.0.1:8000/health || echo "API server may not be ready yet"
+
+      - name: Smoke test - API recommendations endpoint
+        run: |
+          python -m pytest tests/smoke/test_api_recommendations.py -v --tb=short
+
+      - name: Smoke test - API inference endpoint
+        run: |
+          python -m pytest tests/smoke/test_api_inference.py -v --tb=short
+
+      - name: Collect API logs
+        if: always()
+        run: |
+          echo "=== API Server Logs ===" && tail -50 api.log || true
+
+      - name: Upload API logs
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: api-logs
+          path: api.log
+
+  summary:
+    name: Pipeline Summary
+    runs-on: ubuntu-latest
+    needs: [ smoke-tests-training, smoke-tests-inference, api-tests ]
+    if: always()
+
+    steps:
+      - name: Check job status
+        run: |
+          echo "====================================="
+          echo "Pipeline Execution Summary"
+          echo "====================================="
+          echo "Smoke Tests - Training: ${{ needs.smoke-tests-training.result }}"
+          echo "Smoke Tests - Inference: ${{ needs.smoke-tests-inference.result }}"
+          echo "API Tests: ${{ needs.api-tests.result }}"
+          echo "====================================="
+          if [[ "${{ needs.smoke-tests-training.result }}" == "failure" ]] || \
+             [[ "${{ needs.smoke-tests-inference.result }}" == "failure" ]] || \
+             [[ "${{ needs.api-tests.result }}" == "failure" ]]; then
+            echo "Pipeline failed!"
+            exit 1
+          else
+            echo "All pipeline stages passed!"
+          fi
